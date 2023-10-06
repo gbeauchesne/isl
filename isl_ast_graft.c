@@ -1,6 +1,7 @@
 /*
  * Copyright 2012      Ecole Normale Superieure
  * Copyright 2014      INRIA Rocquencourt
+ * Copyright 2019      Cerebras Systems
  *
  * Use of this software is governed by the MIT license
  *
@@ -8,21 +9,28 @@
  * Ecole Normale Superieure, 45 rue d’Ulm, 75230 Paris, France
  * and Inria Paris - Rocquencourt, Domaine de Voluceau - Rocquencourt,
  * B.P. 105 - 78153 Le Chesnay, France
+ * and Cerebras Systems, 175 S San Antonio Rd, Los Altos, CA, USA
  */
 
+#include <isl/id.h>
 #include <isl/space.h>
+#include <isl/stream.h>
 #include <isl_ast_private.h>
 #include <isl_ast_build_expr.h>
 #include <isl_ast_build_private.h>
 #include <isl_ast_graft_private.h>
+#include "isl_set_to_ast_graft_list.h"
 
 static __isl_give isl_ast_graft *isl_ast_graft_copy(
 	__isl_keep isl_ast_graft *graft);
+static __isl_give isl_ast_graft *isl_stream_read_ast_graft(
+	__isl_keep isl_stream *s);
 
-#undef BASE
-#define BASE ast_graft
+#undef EL_BASE
+#define EL_BASE ast_graft
 
 #include <isl_list_templ.c>
+#include <isl_list_read_templ.c>
 
 #undef BASE
 #define BASE ast_graft
@@ -41,37 +49,54 @@ __isl_give isl_ast_node *isl_ast_graft_get_node(
 	return graft ? isl_ast_node_copy(graft->node) : NULL;
 }
 
-/* Create a graft for "node" with no guards and no enforced conditions.
+/* Create a graft for "node" with guards "guard" and
+ * enforced conditions "enforced".
  */
-__isl_give isl_ast_graft *isl_ast_graft_alloc(
-	__isl_take isl_ast_node *node, __isl_keep isl_ast_build *build)
+static isl_ast_graft *graft_alloc(__isl_take isl_ast_node *node,
+	__isl_take isl_set *guard, __isl_take isl_basic_set *enforced)
 {
 	isl_ctx *ctx;
-	isl_space *space;
 	isl_ast_graft *graft;
 
-	if (!node)
-		return NULL;
+	if (!node || !guard || !enforced)
+		goto error;
 
 	ctx = isl_ast_node_get_ctx(node);
 	graft = isl_calloc_type(ctx, isl_ast_graft);
 	if (!graft)
 		goto error;
 
-	space = isl_ast_build_get_space(build, 1);
-
 	graft->ref = 1;
 	graft->node = node;
-	graft->guard = isl_set_universe(isl_space_copy(space));
-	graft->enforced = isl_basic_set_universe(space);
-
-	if (!graft->guard || !graft->enforced)
-		return isl_ast_graft_free(graft);
+	graft->guard = guard;
+	graft->enforced = enforced;
 
 	return graft;
 error:
 	isl_ast_node_free(node);
+	isl_set_free(guard);
+	isl_basic_set_free(enforced);
 	return NULL;
+}
+
+/* Create a graft for "node" with no guards and no enforced conditions.
+ */
+__isl_give isl_ast_graft *isl_ast_graft_alloc(
+	__isl_take isl_ast_node *node, __isl_keep isl_ast_build *build)
+{
+	isl_space *space;
+	isl_set *guard;
+	isl_basic_set *enforced;
+
+	if (!node)
+		return NULL;
+
+	space = isl_ast_build_get_space(build, 1);
+
+	guard = isl_set_universe(isl_space_copy(space));
+	enforced = isl_basic_set_universe(space);
+
+	return graft_alloc(node, guard, enforced);
 }
 
 /* Create a graft with no guards and no enforced conditions
@@ -101,36 +126,43 @@ static __isl_give isl_ast_graft *isl_ast_graft_copy(
 /* Do all the grafts in "list" have the same guard and is this guard
  * independent of the current depth?
  */
-static int equal_independent_guards(__isl_keep isl_ast_graft_list *list,
+static isl_bool equal_independent_guards(__isl_keep isl_ast_graft_list *list,
 	__isl_keep isl_ast_build *build)
 {
-	int i, n;
-	int depth;
+	int i;
+	isl_size n;
+	isl_size depth;
+	isl_size dim;
 	isl_ast_graft *graft_0;
-	int equal = 1;
-	int skip;
+	isl_bool equal = isl_bool_true;
+	isl_bool skip;
 
+	n = isl_ast_graft_list_n_ast_graft(list);
+	depth = isl_ast_build_get_depth(build);
+	if (n < 0 || depth < 0)
+		return isl_bool_error;
 	graft_0 = isl_ast_graft_list_get_ast_graft(list, 0);
 	if (!graft_0)
-		return -1;
+		return isl_bool_error;
 
-	depth = isl_ast_build_get_depth(build);
-	if (isl_set_dim(graft_0->guard, isl_dim_set) <= depth)
-		skip = 0;
+	dim = isl_set_dim(graft_0->guard, isl_dim_set);
+	if (dim < 0)
+		skip = isl_bool_error;
+	else if (dim <= depth)
+		skip = isl_bool_false;
 	else
 		skip = isl_set_involves_dims(graft_0->guard,
 						isl_dim_set, depth, 1);
 	if (skip < 0 || skip) {
 		isl_ast_graft_free(graft_0);
-		return skip < 0 ? -1 : 0;
+		return isl_bool_not(skip);
 	}
 
-	n = isl_ast_graft_list_n_ast_graft(list);
 	for (i = 1; i < n; ++i) {
 		isl_ast_graft *graft;
 		graft = isl_ast_graft_list_get_ast_graft(list, i);
 		if (!graft)
-			equal = -1;
+			equal = isl_bool_error;
 		else
 			equal = isl_set_is_equal(graft_0->guard, graft->guard);
 		isl_ast_graft_free(graft);
@@ -150,10 +182,14 @@ static int equal_independent_guards(__isl_keep isl_ast_graft_list *list,
 static __isl_give isl_set *hoist_guard(__isl_take isl_set *guard,
 	__isl_keep isl_ast_build *build)
 {
-	int depth;
+	isl_size depth;
+	isl_size dim;
 
 	depth = isl_ast_build_get_depth(build);
-	if (depth < isl_set_dim(guard, isl_dim_set)) {
+	dim = isl_set_dim(guard, isl_dim_set);
+	if (depth < 0 || dim < 0)
+		return isl_set_free(guard);
+	if (depth < dim) {
 		guard = isl_set_remove_divs_involving_dims(guard,
 						isl_dim_set, depth, 1);
 		guard = isl_set_eliminate(guard, isl_dim_set, depth, 1);
@@ -192,8 +228,9 @@ static __isl_give isl_set *hoist_guard(__isl_take isl_set *guard,
 __isl_give isl_set *isl_ast_graft_list_extract_hoistable_guard(
 	__isl_keep isl_ast_graft_list *list, __isl_keep isl_ast_build *build)
 {
-	int i, n;
-	int equal;
+	int i;
+	isl_size n;
+	isl_bool equal;
 	isl_ctx *ctx;
 	isl_set *guard;
 	isl_set_list *set_list;
@@ -203,6 +240,8 @@ __isl_give isl_set *isl_ast_graft_list_extract_hoistable_guard(
 		return NULL;
 
 	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
+		return NULL;
 	if (n == 0)
 		return isl_set_universe(isl_ast_build_get_space(build, 1));
 
@@ -276,10 +315,13 @@ static __isl_give isl_ast_node *ast_node_insert_if(
 {
 	struct isl_insert_if_data data;
 	isl_ctx *ctx;
+	isl_size n;
 
+	n = isl_set_n_basic_set(guard);
+	if (n < 0)
+		goto error;
 	ctx = isl_ast_build_get_ctx(build);
-	if (isl_options_get_ast_build_allow_or(ctx) ||
-	    isl_set_n_basic_set(guard) <= 1) {
+	if (isl_options_get_ast_build_allow_or(ctx) || n <= 1) {
 		isl_ast_node *if_node;
 		isl_ast_expr *expr;
 
@@ -300,6 +342,10 @@ static __isl_give isl_ast_node *ast_node_insert_if(
 	isl_set_free(guard);
 	isl_ast_node_free(data.node);
 	return isl_ast_node_alloc_block(data.list);
+error:
+	isl_set_free(guard);
+	isl_ast_node_free(node);
+	return NULL;
 }
 
 /* Insert an if node around a copy of "data->node" testing the condition
@@ -339,9 +385,7 @@ static __isl_give isl_ast_graft *insert_if_node(
 		return graft;
 	}
 
-	build = isl_ast_build_copy(build);
 	graft->node = ast_node_insert_if(graft->node, guard, build);
-	isl_ast_build_free(build);
 
 	if (!graft->node)
 		return isl_ast_graft_free(graft);
@@ -388,10 +432,14 @@ static __isl_give isl_basic_set *update_enforced(
 	__isl_take isl_basic_set *enforced, __isl_keep isl_ast_graft *graft,
 	int depth)
 {
+	isl_size dim;
 	isl_basic_set *enforced_g;
 
 	enforced_g = isl_ast_graft_get_enforced(graft);
-	if (depth < isl_basic_set_dim(enforced_g, isl_dim_set))
+	dim = isl_basic_set_dim(enforced_g, isl_dim_set);
+	if (dim < 0)
+		enforced_g = isl_basic_set_free(enforced_g);
+	if (depth < dim)
 		enforced_g = isl_basic_set_eliminate(enforced_g,
 							isl_dim_set, depth, 1);
 	enforced_g = isl_basic_set_remove_unknown_divs(enforced_g);
@@ -443,22 +491,22 @@ static __isl_give isl_ast_graft_list *graft_extend_body(
 	__isl_keep isl_ast_node **body, __isl_take isl_ast_graft *graft,
 	__isl_keep isl_ast_build *build)
 {
-	int n;
-	int depth;
+	isl_size n;
+	isl_size depth;
 	isl_ast_graft *last;
 	isl_space *space;
 	isl_basic_set *enforced;
 
-	if (!list || !graft)
+	n = isl_ast_graft_list_n_ast_graft(list);
+	depth = isl_ast_build_get_depth(build);
+	if (n < 0 || depth < 0 || !graft)
 		goto error;
 	extend_body(body, isl_ast_node_copy(graft->node));
 	if (!*body)
 		goto error;
 
-	n = isl_ast_graft_list_n_ast_graft(list);
 	last = isl_ast_graft_list_get_ast_graft(list, n - 1);
 
-	depth = isl_ast_build_get_depth(build);
 	space = isl_ast_build_get_space(build, 1);
 	enforced = isl_basic_set_empty(space);
 	enforced = update_enforced(enforced, last, depth);
@@ -542,17 +590,18 @@ static __isl_give isl_ast_graft_list *insert_pending_guard_nodes(
 	__isl_take isl_ast_graft_list *list,
 	__isl_keep isl_ast_build *build)
 {
-	int i, j, n, n_if;
+	int i, j, n_if;
+	isl_size n;
 	int allow_else;
 	isl_ctx *ctx;
 	isl_ast_graft_list *res;
 	struct isl_if_node *if_node = NULL;
 
-	if (!build || !list)
+	n = isl_ast_graft_list_n_ast_graft(list);
+	if (!build || n < 0)
 		return isl_ast_graft_list_free(list);
 
 	ctx = isl_ast_build_get_ctx(build);
-	n = isl_ast_graft_list_n_ast_graft(list);
 
 	allow_else = isl_options_get_ast_build_allow_else(ctx);
 
@@ -662,15 +711,16 @@ static __isl_give isl_ast_graft_list *insert_pending_guard_nodes(
 __isl_give isl_ast_graft_list *isl_ast_graft_list_insert_pending_guard_nodes(
 	__isl_take isl_ast_graft_list *list, __isl_keep isl_ast_build *build)
 {
-	int i, n;
+	int i;
+	isl_size n;
 	isl_set *universe;
 
 	list = insert_pending_guard_nodes(list, build);
-	if (!list)
-		return NULL;
+	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
+		return isl_ast_graft_list_free(list);
 
 	universe = isl_set_universe(isl_ast_build_get_space(build, 1));
-	n = isl_ast_graft_list_n_ast_graft(list);
 	for (i = 0; i < n; ++i) {
 		isl_ast_graft *graft;
 
@@ -695,14 +745,15 @@ __isl_give isl_ast_graft_list *isl_ast_graft_list_insert_pending_guard_nodes(
 static __isl_give isl_ast_node_list *extract_node_list(
 	__isl_keep isl_ast_graft_list *list)
 {
-	int i, n;
+	int i;
+	isl_size n;
 	isl_ctx *ctx;
 	isl_ast_node_list *node_list;
 
-	if (!list)
+	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
 		return NULL;
 	ctx = isl_ast_graft_list_get_ctx(list);
-	n = isl_ast_graft_list_n_ast_graft(list);
 	node_list = isl_ast_node_list_alloc(ctx, n);
 	for (i = 0; i < n; ++i) {
 		isl_ast_node *node;
@@ -726,19 +777,20 @@ __isl_give isl_basic_set *isl_ast_graft_list_extract_shared_enforced(
 	__isl_keep isl_ast_graft_list *list,
 	__isl_keep isl_ast_build *build)
 {
-	int i, n;
-	int depth;
+	int i;
+	isl_size n;
+	isl_size depth;
 	isl_space *space;
 	isl_basic_set *enforced;
 
-	if (!list)
+	n = isl_ast_graft_list_n_ast_graft(list);
+	depth = isl_ast_build_get_depth(build);
+	if (n < 0 || depth < 0)
 		return NULL;
 
 	space = isl_ast_build_get_space(build, 1);
 	enforced = isl_basic_set_empty(space);
 
-	depth = isl_ast_build_get_depth(build);
-	n = isl_ast_graft_list_n_ast_graft(list);
 	for (i = 0; i < n; ++i) {
 		isl_ast_graft *graft;
 
@@ -793,12 +845,13 @@ error:
 static __isl_give isl_ast_graft_list *gist_guards(
 	__isl_take isl_ast_graft_list *list, __isl_keep isl_set *context)
 {
-	int i, n;
-
-	if (!list)
-		return NULL;
+	int i;
+	isl_size n;
 
 	n = isl_ast_graft_list_n_ast_graft(list);
+	if (!list)
+		return isl_ast_graft_list_free(list);
+
 	for (i = 0; i < n; ++i) {
 		isl_ast_graft *graft;
 
@@ -908,11 +961,13 @@ __isl_give isl_ast_graft_list *isl_ast_graft_list_fuse(
 	__isl_take isl_ast_graft_list *list,
 	__isl_keep isl_ast_build *build)
 {
+	isl_size n;
 	isl_ast_graft *graft;
 
-	if (!list)
-		return NULL;
-	if (isl_ast_graft_list_n_ast_graft(list) <= 1)
+	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
+		return isl_ast_graft_list_free(list);
+	if (n <= 1)
 		return list;
 	graft = ast_graft_list_fuse(list, build);
 	return isl_ast_graft_list_from_ast_graft(graft);
@@ -992,7 +1047,7 @@ __isl_give isl_ast_node *isl_ast_node_from_graft_list(
 	return isl_ast_node_from_ast_node_list(node_list);
 }
 
-void *isl_ast_graft_free(__isl_take isl_ast_graft *graft)
+__isl_null isl_ast_graft *isl_ast_graft_free(__isl_take isl_ast_graft *graft)
 {
 	if (!graft)
 		return NULL;
@@ -1097,9 +1152,12 @@ __isl_give isl_ast_graft *isl_ast_graft_unembed(__isl_take isl_ast_graft *graft,
 __isl_give isl_ast_graft_list *isl_ast_graft_list_unembed(
 	__isl_take isl_ast_graft_list *list, int product)
 {
-	int i, n;
+	int i;
+	isl_size n;
 
 	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
+		return isl_ast_graft_list_free(list);
 	for (i = 0; i < n; ++i) {
 		isl_ast_graft *graft;
 
@@ -1139,9 +1197,12 @@ __isl_give isl_ast_graft *isl_ast_graft_preimage_multi_aff(
 __isl_give isl_ast_graft_list *isl_ast_graft_list_preimage_multi_aff(
 	__isl_take isl_ast_graft_list *list, __isl_take isl_multi_aff *ma)
 {
-	int i, n;
+	int i;
+	isl_size n;
 
 	n = isl_ast_graft_list_n_ast_graft(list);
+	if (n < 0)
+		list = isl_ast_graft_list_free(list);
 	for (i = 0; i < n; ++i) {
 		isl_ast_graft *graft;
 
@@ -1277,6 +1338,149 @@ error:
 	return NULL;
 }
 
+/* Internal data structure for split_on_guard.
+ *
+ * "guard2list" is the constructed associative array.
+ * "any_match" gets set if any guard was seen more than once.
+ */
+struct isl_split_on_guard_data {
+	isl_set_to_ast_graft_list *guard2list;
+	int *any_match;
+};
+
+/* Add "graft" to the list associated to its guard in data->guard2list.
+ * If some other graft was already associated to this guard,
+ * then set data->any_match.
+ */
+static isl_stat add_to_guard_list(__isl_take isl_ast_graft *graft, void *user)
+{
+	struct isl_split_on_guard_data *data = user;
+	isl_set *guard;
+	isl_maybe_isl_ast_graft_list m;
+
+	if (!graft)
+		return isl_stat_error;
+	m = isl_set_to_ast_graft_list_try_get(data->guard2list, graft->guard);
+	if (m.valid < 0)
+		return isl_stat_non_null(isl_ast_graft_free(graft));
+
+	if (m.valid) {
+		*data->any_match = 1;
+		m.value = isl_ast_graft_list_add(m.value, graft);
+	} else {
+		m.value = isl_ast_graft_list_from_ast_graft(graft);
+	}
+	guard = isl_set_copy(graft->guard);
+	data->guard2list =
+		isl_set_to_ast_graft_list_set(data->guard2list, guard, m.value);
+
+	return isl_stat_non_null(data->guard2list);
+}
+
+/* Construct an associative array that groups the elements
+ * of "list" based on their guards.
+ * If any guard appears more than once, then set "any_match".
+ */
+static __isl_give isl_set_to_ast_graft_list *split_on_guard(
+	__isl_keep isl_ast_graft_list *list, int *any_match)
+{
+	struct isl_split_on_guard_data data = { NULL, any_match };
+	isl_size n;
+	isl_ctx *ctx;
+
+	n = isl_ast_graft_list_size(list);
+	if (n < 0)
+		return NULL;
+
+	ctx = isl_ast_graft_list_get_ctx(list);
+	data.guard2list = isl_set_to_ast_graft_list_alloc(ctx, n);
+
+	if (isl_ast_graft_list_foreach(list, &add_to_guard_list, &data) < 0)
+		return isl_set_to_ast_graft_list_free(data.guard2list);
+
+	return data.guard2list;
+}
+
+/* Add the elements of "guard_list" to "list".
+ */
+static isl_stat add_same_guard(__isl_take isl_set *guard,
+	__isl_take isl_ast_graft_list *guard_list, void *user)
+{
+	isl_ast_graft_list **list = user;
+
+	isl_set_free(guard);
+	*list = isl_ast_graft_list_concat(*list, guard_list);
+
+	return isl_stat_non_null(*list);
+}
+
+/* Given an associative array "guard2list" containing the elements
+ * of "list" grouped on common guards, reconstruct "list"
+ * by placing elements with the same guard consecutively.
+ */
+static __isl_give isl_ast_graft_list *reconstruct(
+	__isl_take isl_ast_graft_list *list,
+	__isl_keep isl_set_to_ast_graft_list *guard2list,
+	__isl_keep isl_ast_build *build)
+{
+	list = isl_ast_graft_list_clear(list);
+	if (isl_set_to_ast_graft_list_foreach(guard2list,
+						&add_same_guard, &list) < 0)
+		list = isl_ast_graft_list_free(list);
+
+	return list;
+}
+
+/* Group the grafts in "list" based on identical guards.
+ *
+ * Note that there need to be a least three elements in the list
+ * for the elements not to be grouped already.
+ *
+ * Group the elements in an associative array based on their guards.
+ * If any guard was seen more than once, then reconstruct the list
+ * from the associative array.  Otherwise, simply return the original list.
+ */
+__isl_give isl_ast_graft_list *isl_ast_graft_list_group_on_guard(
+	__isl_take isl_ast_graft_list *list, __isl_keep isl_ast_build *build)
+{
+	int any_match = 0;
+	isl_size n;
+	isl_set_to_ast_graft_list *guard2list;
+
+	n = isl_ast_graft_list_size(list);
+	if (n < 0)
+		return isl_ast_graft_list_free(list);
+	if (n <= 2)
+		return list;
+
+	guard2list = split_on_guard(list, &any_match);
+	if (any_match)
+		list = reconstruct(list, guard2list, build);
+
+	isl_set_to_ast_graft_list_free(guard2list);
+
+	return list;
+}
+
+/* An enumeration of the keys that appear in the textual representation
+ * of an isl_sat_graft object.
+ */
+enum isl_graft_key {
+	isl_graft_key_error = -1,
+	isl_graft_key_guard,
+	isl_graft_key_enforced,
+	isl_graft_key_node,
+	isl_graft_key_end
+};
+
+/* Textual representations of the keys for an isl_sat_graft object.
+ */
+static char *key_str[] = {
+	[isl_graft_key_guard] = "guard",
+	[isl_graft_key_enforced] = "enforced",
+	[isl_graft_key_node] = "node",
+};
+
 __isl_give isl_printer *isl_printer_print_ast_graft(__isl_take isl_printer *p,
 	__isl_keep isl_ast_graft *graft)
 {
@@ -1286,15 +1490,91 @@ __isl_give isl_printer *isl_printer_print_ast_graft(__isl_take isl_printer *p,
 		return isl_printer_free(p);
 
 	p = isl_printer_print_str(p, "(");
-	p = isl_printer_print_str(p, "guard: ");
+	p = isl_printer_print_str(p, key_str[isl_graft_key_guard]);
+	p = isl_printer_print_str(p, ": ");
 	p = isl_printer_print_set(p, graft->guard);
 	p = isl_printer_print_str(p, ", ");
-	p = isl_printer_print_str(p, "enforced: ");
+	p = isl_printer_print_str(p, key_str[isl_graft_key_enforced]);
+	p = isl_printer_print_str(p, ": ");
 	p = isl_printer_print_basic_set(p, graft->enforced);
 	p = isl_printer_print_str(p, ", ");
-	p = isl_printer_print_str(p, "node: ");
+	p = isl_printer_print_str(p, key_str[isl_graft_key_node]);
+	p = isl_printer_print_str(p, ": ");
 	p = isl_printer_print_ast_node(p, graft->node);
 	p = isl_printer_print_str(p, ")");
 
 	return p;
+}
+
+#undef KEY
+#define KEY enum isl_graft_key
+#undef KEY_ERROR
+#define KEY_ERROR isl_graft_key_error
+#undef KEY_END
+#define KEY_END isl_graft_key_end
+#undef KEY_STR
+#define KEY_STR key_str
+#undef KEY_EXTRACT
+#define KEY_EXTRACT extract_key
+#undef KEY_GET
+#define KEY_GET get_key
+#include "extract_key.c"
+
+/* Read the key "key" from "s", along with the subsequent colon.
+ */
+static isl_stat read_key(__isl_keep isl_stream *s, enum isl_graft_key key)
+{
+	enum isl_graft_key extracted;
+
+	extracted = get_key(s);
+	if (extracted < 0)
+		return isl_stat_error;
+	if (extracted != key)
+		isl_die(isl_stream_get_ctx(s), isl_error_invalid,
+			"expecting different field", return isl_stat_error);
+	if (isl_stream_eat(s, ':') < 0)
+		return isl_stat_error;
+	return isl_stat_ok;
+}
+
+/* Read an isl_ast_graft object from "s".
+ *
+ * Read the pieces in the way they are printed in isl_printer_print_ast_graft.
+ */
+static __isl_give isl_ast_graft *isl_stream_read_ast_graft(
+	__isl_keep isl_stream *s)
+{
+	isl_set *guard;
+	isl_basic_set *enforced = NULL;
+	isl_ast_node *node = NULL;
+
+	if (isl_stream_eat(s, '(') < 0)
+		return NULL;
+	if (read_key(s, isl_graft_key_guard) < 0)
+		return NULL;
+	guard = isl_stream_read_set(s);
+	if (!guard)
+		goto error;
+	if (isl_stream_eat(s, ',') < 0)
+		goto error;
+	if (read_key(s, isl_graft_key_enforced) < 0)
+		goto error;
+	enforced = isl_stream_read_basic_set(s);
+	if (!enforced)
+		goto error;
+	if (isl_stream_eat(s, ',') < 0)
+		goto error;
+	if (read_key(s, isl_graft_key_node) < 0)
+		goto error;
+	node = isl_stream_read_ast_node(s);
+	if (!node)
+		goto error;
+	if (isl_stream_eat(s, ')') < 0)
+		goto error;
+	return graft_alloc(node, guard, enforced);
+error:
+	isl_set_free(guard);
+	isl_basic_set_free(enforced);
+	isl_ast_node_free(node);
+	return NULL;
 }

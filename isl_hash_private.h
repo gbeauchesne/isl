@@ -1,8 +1,8 @@
-#ifndef ISL_HASH_PRIVATE
-#define ISL_HASH_PRIVATE
+#ifndef ISL_HASH_PRIVATE_H
+#define ISL_HASH_PRIVATE_H
 
 #include <isl/hash.h>
 
-extern struct isl_hash_table_entry *isl_hash_table_entry_none;
+struct isl_hash_table_entry *isl_hash_table_first(struct isl_hash_table *table);
 
 #endif

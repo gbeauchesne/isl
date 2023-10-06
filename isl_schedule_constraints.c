@@ -176,11 +176,17 @@ error:
 }
 
 /* Replace the constraints of type "type" in "sc" by "c".
+ *
+ * First detect any equality constraints that may be implicit in "c"
+ * in order to try and improve the accuracy of the input (and therefore
+ * also the output) of the isl_set_coefficients calls
+ * that are eventually performed on (some of) these constraints.
  */
 static __isl_give isl_schedule_constraints *isl_schedule_constraints_set(
 	__isl_take isl_schedule_constraints *sc, enum isl_edge_type type,
 	__isl_take isl_union_map *c)
 {
+	c = isl_union_map_detect_equalities(c);
 	if (!sc || !c)
 		goto error;
 
@@ -479,6 +485,18 @@ static char *key_str[] = {
 	[isl_sc_key_context] = "context",
 };
 
+#undef BASE
+#define BASE set
+#include "print_yaml_field_templ.c"
+
+#undef BASE
+#define BASE union_set
+#include "print_yaml_field_templ.c"
+
+#undef BASE
+#define BASE union_map
+#include "print_yaml_field_templ.c"
+
 /* Print a key, value pair for the edge of type "type" in "sc" to "p".
  *
  * If the edge relation is empty, then it is not printed since
@@ -495,10 +513,7 @@ static __isl_give isl_printer *print_constraint(__isl_take isl_printer *p,
 	if (empty)
 		return p;
 
-	p = isl_printer_print_str(p, key_str[type]);
-	p = isl_printer_yaml_next(p);
-	p = isl_printer_print_union_map(p, sc->constraint[type]);
-	p = isl_printer_yaml_next(p);
+	p = print_yaml_field_union_map(p, key_str[type], sc->constraint[type]);
 
 	return p;
 }
@@ -518,19 +533,14 @@ __isl_give isl_printer *isl_printer_print_schedule_constraints(
 		return isl_printer_free(p);
 
 	p = isl_printer_yaml_start_mapping(p);
-	p = isl_printer_print_str(p, key_str[isl_sc_key_domain]);
-	p = isl_printer_yaml_next(p);
-	p = isl_printer_print_union_set(p, sc->domain);
-	p = isl_printer_yaml_next(p);
+	p = print_yaml_field_union_set(p, key_str[isl_sc_key_domain],
+					sc->domain);
 	universe = isl_set_plain_is_universe(sc->context);
 	if (universe < 0)
 		return isl_printer_free(p);
-	if (!universe) {
-		p = isl_printer_print_str(p, key_str[isl_sc_key_context]);
-		p = isl_printer_yaml_next(p);
-		p = isl_printer_print_set(p, sc->context);
-		p = isl_printer_yaml_next(p);
-	}
+	if (!universe)
+		p = print_yaml_field_set(p, key_str[isl_sc_key_context],
+						sc->context);
 	p = print_constraint(p, sc, isl_edge_validity);
 	p = print_constraint(p, sc, isl_edge_proximity);
 	p = print_constraint(p, sc, isl_edge_coincidence);
@@ -551,6 +561,12 @@ __isl_give isl_printer *isl_printer_print_schedule_constraints(
 #define KEY_ERROR isl_sc_key_error
 #undef KEY_END
 #define KEY_END isl_sc_key_end
+#undef KEY_STR
+#define KEY_STR key_str
+#undef KEY_EXTRACT
+#define KEY_EXTRACT extract_key
+#undef KEY_GET
+#define KEY_GET get_key
 #include "extract_key.c"
 
 #undef BASE
@@ -578,16 +594,17 @@ __isl_give isl_schedule_constraints *isl_stream_read_schedule_constraints(
 {
 	isl_ctx *ctx;
 	isl_schedule_constraints *sc;
-	int more;
+	isl_bool more;
 	int domain_set = 0;
 
-	if (isl_stream_yaml_read_start_mapping(s))
+	if (isl_stream_yaml_read_start_mapping(s) < 0)
 		return NULL;
 
 	ctx = isl_stream_get_ctx(s);
 	sc = isl_schedule_constraints_alloc(ctx);
-	while ((more = isl_stream_yaml_next(s)) > 0) {
+	while ((more = isl_stream_yaml_next(s)) == isl_bool_true) {
 		enum isl_sc_key key;
+		enum isl_edge_type type;
 		isl_set *context;
 		isl_union_set *domain;
 		isl_union_map *constraints;
@@ -617,8 +634,10 @@ __isl_give isl_schedule_constraints *isl_stream_read_schedule_constraints(
 		case isl_sc_key_condition:
 		case isl_sc_key_conditional_validity:
 		case isl_sc_key_proximity:
+			type = (enum isl_edge_type) key;
 			constraints = read_union_map(s);
-			sc = isl_schedule_constraints_set(sc, key, constraints);
+			sc = isl_schedule_constraints_set(sc, type,
+								constraints);
 			if (!sc)
 				return NULL;
 			break;
@@ -627,10 +646,8 @@ __isl_give isl_schedule_constraints *isl_stream_read_schedule_constraints(
 	if (more < 0)
 		return isl_schedule_constraints_free(sc);
 
-	if (isl_stream_yaml_read_end_mapping(s) < 0) {
-		isl_stream_error(s, NULL, "unexpected extra elements");
+	if (isl_stream_yaml_read_end_mapping(s) < 0)
 		return isl_schedule_constraints_free(sc);
-	}
 
 	if (!domain_set) {
 		isl_stream_error(s, NULL, "no domain specified");
@@ -657,22 +674,9 @@ __isl_give isl_schedule_constraints *isl_schedule_constraints_read_from_file(
 	return sc;
 }
 
-/* Read an isl_schedule_constraints object from the string "str".
- */
-__isl_give isl_schedule_constraints *isl_schedule_constraints_read_from_str(
-	isl_ctx *ctx, const char *str)
-{
-	struct isl_stream *s;
-	isl_schedule_constraints *sc;
-
-	s = isl_stream_new_str(ctx, str);
-	if (!s)
-		return NULL;
-	sc = isl_stream_read_schedule_constraints(s);
-	isl_stream_free(s);
-
-	return sc;
-}
+#undef TYPE_BASE
+#define TYPE_BASE	schedule_constraints
+#include "isl_read_from_str_templ.c"
 
 /* Align the parameters of the fields of "sc".
  */
@@ -710,11 +714,13 @@ isl_schedule_constraints_align_params(__isl_take isl_schedule_constraints *sc)
 static isl_stat add_n_basic_map(__isl_take isl_map *map, void *user)
 {
 	int *n = user;
+	isl_size n_basic_map;
 
-	*n += isl_map_n_basic_map(map);
+	n_basic_map = isl_map_n_basic_map(map);
+	*n += n_basic_map;
 	isl_map_free(map);
 
-	return isl_stat_ok;
+	return n_basic_map < 0 ? isl_stat_error : isl_stat_ok;
 }
 
 /* Return the total number of isl_basic_maps in the constraints of "sc".
@@ -738,13 +744,19 @@ int isl_schedule_constraints_n_basic_map(
 
 /* Return the total number of isl_maps in the constraints of "sc".
  */
-int isl_schedule_constraints_n_map(__isl_keep isl_schedule_constraints *sc)
+isl_size isl_schedule_constraints_n_map(__isl_keep isl_schedule_constraints *sc)
 {
 	enum isl_edge_type i;
 	int n = 0;
 
-	for (i = isl_edge_first; i <= isl_edge_last; ++i)
-		n += isl_union_map_n_map(sc->constraint[i]);
+	for (i = isl_edge_first; i <= isl_edge_last; ++i) {
+		isl_size n_i;
+
+		n_i = isl_union_map_n_map(sc->constraint[i]);
+		if (n_i < 0)
+			return isl_size_error;
+		n += n_i;
+	}
 
 	return n;
 }

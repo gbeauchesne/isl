@@ -1,3 +1,4 @@
+#include <isl/id.h>
 #include <isl/val.h>
 #include <isl/schedule.h>
 #include <isl/stream.h>
@@ -55,6 +56,12 @@ static char *key_str[] = {
 #define KEY_ERROR isl_schedule_key_error
 #undef KEY_END
 #define KEY_END isl_schedule_key_end
+#undef KEY_STR
+#define KEY_STR key_str
+#undef KEY_EXTRACT
+#define KEY_EXTRACT extract_key
+#undef KEY_GET
+#define KEY_GET get_key
 #include "extract_key.c"
 
 static __isl_give isl_schedule_tree *isl_stream_read_schedule_tree(
@@ -70,7 +77,7 @@ static __isl_give isl_schedule_tree *read_context(__isl_keep isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -121,7 +128,7 @@ static __isl_give isl_schedule_tree *read_domain(__isl_keep isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -170,7 +177,7 @@ static __isl_give isl_schedule_tree *read_expansion(isl_stream *s)
 	isl_union_pw_multi_aff *contraction = NULL;
 	isl_union_map *expansion = NULL;
 	isl_schedule_tree *tree = NULL;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -215,7 +222,7 @@ static __isl_give isl_schedule_tree *read_expansion(isl_stream *s)
 			isl_die(ctx, isl_error_invalid, "unexpected key",
 				goto error);
 		}
-	} while ((more = isl_stream_yaml_next(s)) > 0);
+	} while ((more = isl_stream_yaml_next(s)) == isl_bool_true);
 
 	if (more < 0)
 		goto error;
@@ -247,7 +254,7 @@ static __isl_give isl_schedule_tree *read_extension(isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -298,7 +305,7 @@ static __isl_give isl_schedule_tree *read_filter(__isl_keep isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -349,7 +356,7 @@ static __isl_give isl_schedule_tree *read_guard(isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -400,7 +407,7 @@ static __isl_give isl_schedule_tree *read_mark(isl_stream *s)
 	struct isl_token *tok;
 	enum isl_schedule_key key;
 	char *str;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -442,32 +449,17 @@ error:
 	return NULL;
 }
 
+#undef EL_BASE
+#define EL_BASE val
+
+#include <isl_list_read_yaml_templ.c>
+
 /* Read a sequence of integers from "s" (representing the coincident
  * property of a band node).
  */
 static __isl_give isl_val_list *read_coincident(__isl_keep isl_stream *s)
 {
-	isl_ctx *ctx;
-	isl_val_list *list;
-	int more;
-
-	ctx = isl_stream_get_ctx(s);
-
-	if (isl_stream_yaml_read_start_sequence(s) < 0)
-		return NULL;
-
-	list = isl_val_list_alloc(ctx, 0);
-	while  ((more = isl_stream_yaml_next(s)) > 0) {
-		isl_val *val;
-
-		val = isl_stream_read_val(s);
-		list = isl_val_list_add(list, val);
-	}
-
-	if (more < 0 || isl_stream_yaml_read_end_sequence(s))
-		list = isl_val_list_free(list);
-
-	return list;
+	return isl_stream_yaml_read_val_list(s);
 }
 
 /* Set the (initial) coincident properties of "band" according to
@@ -477,10 +469,12 @@ static __isl_give isl_schedule_band *set_coincident(
 	__isl_take isl_schedule_band *band, __isl_take isl_val_list *coincident)
 {
 	int i;
-	int n, m;
+	isl_size n, m;
 
 	n = isl_schedule_band_n_member(band);
 	m = isl_val_list_n_val(coincident);
+	if (n < 0 || m < 0)
+		band = isl_schedule_band_free(band);
 
 	for (i = 0; i < n && i < m; ++i) {
 		isl_val *v;
@@ -507,7 +501,7 @@ static __isl_give isl_schedule_tree *read_band(isl_stream *s)
 	isl_ctx *ctx;
 	isl_schedule_band *band;
 	int permutable = 0;
-	int more;
+	isl_bool more;
 
 	ctx = isl_stream_get_ctx(s);
 
@@ -567,7 +561,7 @@ static __isl_give isl_schedule_tree *read_band(isl_stream *s)
 			isl_die(ctx, isl_error_invalid, "unexpected key",
 				goto error);
 		}
-	} while ((more = isl_stream_yaml_next(s)) > 0);
+	} while ((more = isl_stream_yaml_next(s)) == isl_bool_true);
 
 	if (more < 0)
 		goto error;
@@ -595,36 +589,25 @@ error:
 	return NULL;
 }
 
+#undef EL_BASE
+#define EL_BASE schedule_tree
+
+#include <isl_list_read_yaml_templ.c>
+
 /* Read a subtree with root node of type "type" from "s".
  * The node is represented by a sequence of children.
  */
 static __isl_give isl_schedule_tree *read_children(isl_stream *s,
 	enum isl_schedule_node_type type)
 {
-	isl_ctx *ctx;
 	isl_schedule_tree_list *list;
-	int more;
-
-	ctx = isl_stream_get_ctx(s);
 
 	isl_token_free(isl_stream_next_token(s));
 
 	if (isl_stream_yaml_next(s) < 0)
 		return NULL;
 
-	if (isl_stream_yaml_read_start_sequence(s))
-		return NULL;
-
-	list = isl_schedule_tree_list_alloc(ctx, 0);
-	while ((more = isl_stream_yaml_next(s)) > 0) {
-		isl_schedule_tree *tree;
-
-		tree = isl_stream_read_schedule_tree(s);
-		list = isl_schedule_tree_list_add(list, tree);
-	}
-
-	if (more < 0 || isl_stream_yaml_read_end_sequence(s))
-		list = isl_schedule_tree_list_free(list);
+	list = isl_stream_yaml_read_schedule_tree_list(s);
 
 	return isl_schedule_tree_from_children(type, list);
 }
@@ -655,9 +638,9 @@ static __isl_give isl_schedule_tree *isl_stream_read_schedule_tree(
 	enum isl_schedule_key key;
 	struct isl_token *tok;
 	isl_schedule_tree *tree = NULL;
-	int more;
+	isl_bool more;
 
-	if (isl_stream_yaml_read_start_mapping(s))
+	if (isl_stream_yaml_read_start_mapping(s) < 0)
 		return NULL;
 	more = isl_stream_yaml_next(s);
 	if (more < 0)
@@ -713,16 +696,14 @@ static __isl_give isl_schedule_tree *isl_stream_read_schedule_tree(
 		break;
 	case isl_schedule_key_child:
 		isl_die(isl_stream_get_ctx(s), isl_error_unsupported,
-			"cannot identity node type", return NULL);
+			"cannot identify node type", return NULL);
 	case isl_schedule_key_end:
 	case isl_schedule_key_error:
 		return NULL;
 	}
 
-	if (isl_stream_yaml_read_end_mapping(s) < 0) {
-		isl_stream_error(s, NULL, "unexpected extra elements");
+	if (isl_stream_yaml_read_end_mapping(s) < 0)
 		return isl_schedule_tree_free(tree);
-	}
 
 	return tree;
 }
@@ -758,19 +739,6 @@ __isl_give isl_schedule *isl_schedule_read_from_file(isl_ctx *ctx, FILE *input)
 	return schedule;
 }
 
-/* Read an isl_schedule from "str".
- */
-__isl_give isl_schedule *isl_schedule_read_from_str(isl_ctx *ctx,
-	const char *str)
-{
-	struct isl_stream *s;
-	isl_schedule *schedule;
-
-	s = isl_stream_new_str(ctx, str);
-	if (!s)
-		return NULL;
-	schedule = isl_stream_read_schedule(s);
-	isl_stream_free(s);
-
-	return schedule;
-}
+#undef TYPE_BASE
+#define TYPE_BASE	schedule
+#include "isl_read_from_str_templ.c"
