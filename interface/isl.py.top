@@ -1,6 +1,6 @@
 from ctypes import *
 
-isl = cdll.LoadLibrary("libisl.so.13")
+isl = cdll.LoadLibrary("libisl.so")
 libc = cdll.LoadLibrary("libc.so.6")
 
 class Error(Exception):
